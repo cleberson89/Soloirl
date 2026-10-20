@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IRL Studio – OBS Solo</title>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+    #stage { position: absolute; inset: 0; display: grid; gap: 0; padding: 0; }
+    #stage.count-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+    #stage.count-2 { grid-template-columns: 1fr 1fr; gap: 2px; }
+    #stage.count-3, #stage.count-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 2px; }
+    .tile { position: relative; min-height: 0; background: #000; overflow: hidden; }
+    .tile video { width: 100%; height: 100%; object-fit: cover; background: #000; }
+    /* UI só enquanto aguarda conexão — some ao vivo */
+    #ui {
+      position: fixed; inset: 0; pointer-events: none; z-index: 10;
+      transition: opacity .4s;
+    }
+    #ui.hidden { opacity: 0; }
+    #badge {
+      position: absolute; top: 12px; left: 12px;
+      background: #FF1744; color: #fff; font-size: 11px; font-weight: 700;
+      padding: 5px 12px; border-radius: 8px; pointer-events: none;
+    }
+    #status {
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,.75); color: #ccc; padding: 6px 16px;
+      border-radius: 20px; font-size: 13px; max-width: 90%;
+      text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #help {
+      position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+      flex-direction: column; gap: 12px; background: #000; color: #aaa; z-index: 50;
+      padding: 24px; text-align: center;
+    }
+    #help h1 { color: #fff; font-size: 22px; }
+    #help code { background: #1A1A1A; color: #4FC3F7; padding: 10px 16px; border-radius: 10px; font-size: 13px; word-break: break-all; }
+    #unmute {
+      position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 100;
+      padding: 12px 22px; background: #FF1744; color: #fff; border: 0; border-radius: 24px;
+      font-weight: 700; display: none; cursor: pointer; pointer-events: auto;
+    }
+    #pix { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: none; pointer-events: none; z-index: 20; }
+    #pix.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div id="stage" class="count-1"></div>
+  <iframe id="pix" allow="autoplay"></iframe>
+  <div id="ui">
+    <div id="badge">SOLO</div>
+    <div id="status">Iniciando…</div>
+  </div>
+  <div id="help">
+    <h1>IRL Studio – OBS Solo</h1>
+    <p>URL no OBS Browser Source:</p>
+    <code>https://cleberson89.github.io/Soloirl/?room=SEU_CODIGO</code>
+    <p>App: mesmo código → <strong>AO VIVO</strong></p>
+  </div>
+  <button id="unmute" type="button">Clique para liberar áudio</button>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const room = (params.get('room') || '').trim().toUpperCase();
+    const pixUrl = params.get('pix') || '';
+    if (!room || room.length < 4) {
+      document.getElementById('help').style.display = 'flex';
+      document.getElementById('ui').style.display = 'none';
+      throw new Error('room');
+    }
+    const OBS_ID = room + '_obs';
+    const stage = document.getElementById('stage');
+    const statusEl = document.getElementById('status');
+    const uiEl = document.getElementById('ui');
+    const tiles = {};
+    const activeCalls = {};
+    let peer = null, starting = false, idRetry = 0, restartTimer = null, liveUiHidden = false;
+
+    const ICE = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        {
+          urls: [
+            'turn:openrelay.metered.ca:80',
+            'turn:openrelay.metered.ca:443',
+            'turn:openrelay.metered.ca:443?transport=tcp',
+            'turns:openrelay.metered.ca:443'
+          ],
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        }
+      ],
+      sdpSemantics: 'unified-plan',
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      // Pool pequeno ajuda ICE a subir mais rápido no OBS Browser Source
+      iceCandidatePoolSize: 2
+    };
+
+    /** Buffer de reprodução ~5 s (máximo prático no Chromium/OBS). */
+    function applyPlayoutBuffer(pc) {
+      if (!pc || !pc.getReceivers) return;
+      try {
+        pc.getReceivers().forEach(function (r) {
+          if (!r || !r.track) return;
+          try {
+            // Chrome limita jitterBufferTarget a 0–4000 ms
+            if ('jitterBufferTarget' in r) r.jitterBufferTarget = 4000;
+          } catch (e) {}
+          try {
+            // Preferência de atraso de playout em segundos (~5 s)
+            if ('playoutDelayHint' in r) r.playoutDelayHint = 5.0;
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+
+    function setStatus(t, ms) {
+      statusEl.textContent = t;
+      if (!liveUiHidden) uiEl.classList.remove('hidden');
+      if (ms) setTimeout(() => { if (Object.keys(tiles).length) hideUi(); }, ms);
+    }
+    function hideUi() {
+      liveUiHidden = true;
+      uiEl.classList.add('hidden');
+    }
+    function showUi() {
+      liveUiHidden = false;
+      uiEl.classList.remove('hidden');
+    }
+    function setCount(n) { stage.className = 'count-' + Math.min(Math.max(n || 1, 1), 4); }
+    function hostKey(peerId) {
+      const p = String(peerId || '').split('_');
+      return p.length >= 3 ? p.slice(0, -1).join('_') : peerId;
+    }
+    function displayNameFrom(id, metadata) {
+      if (metadata && metadata.name) {
+        const parts = String(metadata.name).split('_');
+        return parts.length >= 2 ? parts[1] : metadata.name;
+      }
+      const parts = String(id || '').split('_');
+      return parts.length >= 2 ? parts[1] : (id || 'Host');
+    }
+    function trackSummary(stream) {
+      if (!stream) return 'sem stream';
+      const ts = stream.getTracks();
+      if (!ts.length) return '0 tracks';
+      return ts.map(t => t.kind[0] + ':' + t.readyState).join(' ');
+    }
+    function removeTileByKey(key) {
+      const t = tiles[key];
+      if (!t) return;
+      try { if (t.el && t.el.parentNode) t.el.parentNode.removeChild(t.el); } catch (e) {}
+      delete tiles[key];
+      setCount(Object.keys(tiles).length);
+      if (!Object.keys(tiles).length) {
+        showUi();
+        setStatus('SOLO pronto • ' + room, 4000);
+      }
+      broadcastRoster();
+    }
+    function removeTile(id) {
+      removeTileByKey(hostKey(id));
+      if (tiles[id]) removeTileByKey(id);
+    }
+    function addTile(id, name, stream) {
+      const key = hostKey(id);
+      if (!stream || !stream.getTracks || !stream.getTracks().length) return;
+      if (tiles[key]) {
+        const t = tiles[key];
+        t.video.srcObject = stream;
+        t.video.muted = true;
+        t.video.play().catch(() => {});
+        if (t.audio) { t.audio.srcObject = stream; t.audio.play().catch(() => {}); }
+        return;
+      }
+      const el = document.createElement('div');
+      el.className = 'tile';
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = true;
+      video.setAttribute('playsinline', '');
+      video.setAttribute('autoplay', '');
+      // Preferência de decodificação suave no Chromium/OBS (quando existir)
+      try { video.disableRemotePlayback = true; } catch (e) {}
+      video.srcObject = stream;
+      video.play().catch(() => {});
+      el.appendChild(video);
+      const audio = document.createElement('audio');
+      audio.autoplay = true;
+      audio.srcObject = stream;
+      audio.play().catch(() => {});
+      el.appendChild(audio);
+      stage.appendChild(el);
+      tiles[key] = { el, video, audio, peerId: id, lastTime: 0, frozenSince: 0 };
+      setCount(Object.keys(tiles).length);
+      setStatus('Ao vivo • ' + room, 2000);
+      hideUi();
+      unlockAudio();
+      broadcastRoster();
+    }
+
+    function broadcastRoster() {}
+
+    function unlockAudio() {
+      Object.values(tiles).forEach(t => {
+        try {
+          if (t.audio) {
+            t.audio.muted = false;
+            t.audio.volume = 1;
+            const p = t.audio.play();
+            if (p && p.catch) p.catch(() => {});
+          }
+          if (t.video) {
+            // vídeo fica muted (autoplay); áudio vai no <audio>
+            t.video.muted = true;
+            const p = t.video.play();
+            if (p && p.catch) p.catch(() => {});
+          }
+        } catch (e) {}
+      });
+      // OBS Browser Source costuma permitir autoplay; só mostra botão se falhar
+      setTimeout(() => {
+        let need = false;
+        Object.values(tiles).forEach(t => {
+          if (t.audio && t.audio.paused) need = true;
+        });
+        const btn = document.getElementById('unmute');
+        if (btn) btn.style.display = need ? 'block' : 'none';
+      }, 800);
+    }
+    function collectStream(pc) {
+      if (!pc) return null;
+      const ms = new MediaStream();
+      try {
+        (pc.getReceivers ? pc.getReceivers() : []).forEach(r => {
+          if (r.track && r.track.readyState !== 'ended') ms.addTrack(r.track);
+        });
+      } catch (e) {}
+      try {
+        const rs = pc.getRemoteStreams ? pc.getRemoteStreams() : [];
+        rs.forEach(s => s.getTracks().forEach(t => {
+          if (t.readyState !== 'ended' && !ms.getTracks().find(x => x.id === t.id)) ms.addTrack(t);
+        }));
+      } catch (e) {}
+      return ms.getTracks().length ? ms : null;
+    }
+    function bindCallMedia(call, key, name) {
+      const pc = call.peerConnection;
+      const tryApply = () => {
+        let stream = null;
+        try { stream = call.remoteStream || null; } catch (e) {}
+        if (!stream || !stream.getTracks().length) stream = collectStream(pc);
+        if (stream && stream.getTracks().length) {
+          addTile(call.peer, name, stream);
+          applyPlayoutBuffer(pc);
+          return true;
+        }
+        return false;
+      };
+      call.on('stream', (stream) => {
+        if (stream) {
+          addTile(call.peer, name, stream);
+          applyPlayoutBuffer(pc);
+        }
+      });
+      if (pc) {
+        pc.addEventListener('track', (ev) => {
+          if (ev.streams && ev.streams[0]) addTile(call.peer, name, ev.streams[0]);
+          else if (ev.track) addTile(call.peer, name, collectStream(pc) || new MediaStream([ev.track]));
+          applyPlayoutBuffer(pc);
+        });
+        pc.addEventListener('iceconnectionstatechange', () => {
+          const s = pc.iceConnectionState;
+          if (s === 'connected' || s === 'completed') {
+            tryApply();
+            applyPlayoutBuffer(pc);
+          }
+          if (s === 'failed' || s === 'closed') {
+            setTimeout(() => {
+              if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+                if (activeCalls[key] === call) delete activeCalls[key];
+                removeTileByKey(key);
+              }
+            }, 2000);
+          }
+        });
+        pc.addEventListener('connectionstatechange', () => {
+          if (pc.connectionState === 'connected') {
+            tryApply();
+            applyPlayoutBuffer(pc);
+          }
+        });
+      }
+      tryApply();
+      let n = 0;
+      const iv = setInterval(() => {
+        n++;
+        const ok = tryApply();
+        if (ok) applyPlayoutBuffer(pc);
+        if (ok || n >= 40) clearInterval(iv);
+      }, 400);
+    }
+    function destroyPeer() {
+      Object.keys(activeCalls).forEach(k => { try { activeCalls[k].close(); } catch (e) {} delete activeCalls[k]; });
+      Object.keys(tiles).forEach(k => removeTileByKey(k));
+      try { if (peer && !peer.destroyed) peer.destroy(); } catch (e) {}
+      peer = null;
+    }
+    function scheduleRestart(ms) {
+      if (restartTimer) clearTimeout(restartTimer);
+      starting = false;
+      restartTimer = setTimeout(() => { restartTimer = null; start(); }, ms);
+    }
+    function bindHandlers() {
+      peer.on('open', () => {
+        idRetry = 0; starting = false;
+        if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+        showUi();
+        setStatus('SOLO pronto • ' + room, 4000);
+      });
+      peer.on('call', (call) => {
+        const key = hostKey(call.peer);
+        const name = displayNameFrom(call.peer, call.metadata);
+        if (activeCalls[key] && activeCalls[key] !== call) {
+          try { activeCalls[key].close(); } catch (e) {}
+          removeTileByKey(key);
+        }
+        activeCalls[key] = call;
+        showUi();
+        setStatus('Recebendo…');
+        bindCallMedia(call, key, name);
+        try { call.answer(); } catch (e) {}
+        call.on('close', () => { if (activeCalls[key] === call) delete activeCalls[key]; removeTileByKey(key); });
+        call.on('error', () => { if (activeCalls[key] === call) delete activeCalls[key]; removeTileByKey(key); });
+      });
+
+      peer.on('connection', (conn) => { try { conn.close(); } catch (e) {} });
+
+      peer.on('disconnected', () => {
+        showUi();
+        setStatus('SOLO — reconectando…');
+        setTimeout(() => {
+          try {
+            if (!peer || peer.destroyed) { scheduleRestart(2000); return; }
+            if (!peer.disconnected) { setStatus('SOLO pronto • ' + room, 3000); return; }
+            peer.reconnect();
+          } catch (e) { scheduleRestart(3000); }
+        }, 1500);
+      });
+      peer.on('close', () => { if (!starting) { showUi(); setStatus('SOLO — reabrindo…'); scheduleRestart(2500); } });
+      peer.on('error', (err) => {
+        if (err.type === 'unavailable-id') {
+          idRetry++; showUi(); setStatus('ID ocupado…'); destroyPeer();
+          scheduleRestart(Math.min(3000 + idRetry * 2000, 15000));
+        } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'websocket-error') {
+          destroyPeer(); scheduleRestart(4000);
+        } else if (err.type !== 'peer-unavailable') {
+          showUi(); setStatus('Erro: ' + err.type);
+        }
+      });
+    }
+    function start() {
+      if (starting) return;
+      starting = true;
+      showUi();
+      setStatus('SOLO • ' + room + '…');
+      if (pixUrl) {
+        const pix = document.getElementById('pix');
+        pix.src = pixUrl; pix.classList.add('visible');
+      }
+      destroyPeer();
+      setTimeout(() => {
+        try {
+          peer = new Peer(OBS_ID, {
+            host: '0.peerjs.com', port: 443, path: '/', secure: true,
+            debug: 0, pingInterval: 3000, config: ICE
+          });
+          bindHandlers();
+        } catch (e) { starting = false; setStatus('Falha peer'); scheduleRestart(5000); }
+      }, 800);
+    }
+    setInterval(() => {
+      Object.keys(tiles).forEach(key => {
+        const tile = tiles[key];
+        if (!tile || !tile.video) return;
+        const stream = tile.video.srcObject;
+        const tracks = stream ? stream.getTracks() : [];
+        if (!stream || !tracks.length || tracks.every(t => t.readyState === 'ended')) {
+          removeTileByKey(key); return;
+        }
+        try {
+          const ct = tile.video.currentTime;
+          if (Math.abs(ct - (tile.lastTime || 0)) < 0.01) tile.frozenSince = (tile.frozenSince || 0) + 1;
+          else tile.frozenSince = 0;
+          tile.lastTime = ct;
+          // Mais tolerante a micro-pausas de rede (evita “FPS baixo” falso e remoção precoce)
+          if (tile.frozenSince >= 12) tile.video.play().catch(() => {});
+          if (tile.audio && tile.audio.paused) unlockAudio();
+          if (tile.frozenSince >= 35) removeTileByKey(key);
+        } catch (e) {}
+      });
+    }, 1000);
+    document.getElementById('unmute').onclick = function () {
+      Object.values(tiles).forEach(t => {
+        if (t.audio) t.audio.play().catch(() => {});
+        if (t.video) { t.video.muted = true; t.video.play().catch(() => {}); }
+      });
+      this.style.display = 'none';
+    };
+    window.addEventListener('beforeunload', () => destroyPeer());
+    start();
+  </script>
+</body>
+</html>
